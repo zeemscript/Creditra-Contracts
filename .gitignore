@@ -1,11 +1,27 @@
 /target
-Cargo.lock
+# The root workspace lock is committed for reproducible `--locked` builds, so
+# there is deliberately no `Cargo.lock` ignore rule here: an ignored lock file
+# can be regenerated without the change ever being staged, silently
+# reintroducing dependency drift. `scripts/check-toolchain.sh` fails if any
+# required lock file is matched by `.gitignore`.
+# Sub-workspace lock files (e.g. contracts/creditra-credit/Cargo.lock) are
+# committed too, so no `Cargo.lock` rule appears here either.
 **/*.rs.bk
 .env
 /coverage
 test_snapshots/
+*.proptest-regressions
 *.profraw
-
-# Local workflow artifacts (plans, session notes)
+**/*.profraw
 /docs/superpowers/
 /.remember/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+rustup-init.exe
+verify_preservation_baseline.exe
+verify_preservation_baseline.pdb
+*.wasm
+.aider*

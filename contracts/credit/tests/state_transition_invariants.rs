@@ -2,19 +2,52 @@
 
 //! State-transition invariant tests for the Credit contract state machine.
 //!
+//! `docs/state-machine.md` is the normative reference for the graph asserted
+//! here: this suite is the executable half of that document, and the coverage
+//! matrix below is a summary of it, not an independent list.
+//!
 //! # Coverage matrix
 //!
-//! | From       | To         | principal=0 | principal>0 | accrued>0 |
-//! |------------|------------|-------------|-------------|-----------|
-//! | Active     | Suspended  | ✓           | ✓           | ✓         |
-//! | Active     | Defaulted  | ✓           | ✓           | ✓         |
-//! | Active     | Closed     | ✓ (ok)      | ✓ (admin)   | ✓ (admin) |
-//! | Suspended  | Defaulted  | ✓           | ✓           | ✓         |
-//! | Suspended  | Closed     | ✓ (ok)      | ✓ (admin)   | ✓ (admin) |
-//! | Suspended  | Active     | ✓ (reopen)  | ✓ (reopen)  | ✓ (reopen)|
-//! | Defaulted  | Active     | ✓           | ✓           | ✓         |
-//! | Defaulted  | Closed     | ✓ (ok)      | ✓ (admin)   | ✓ (admin) |
-//! | Closed     | *          | ✓ (idempot) | —           | —         |
+//! Every `CreditStatus` variant is a source, a target, or both. The columns are
+//! the three balance shapes the transition must survive unchanged.
+//!
+//! | From           | To         | Entry point                         | Actor   | principal=0 | principal>0 | accrued>0 |
+//! |----------------|------------|-------------------------------------|---------|-------------|-------------|-----------|
+//! | *(none)*       | `Active`   | `open_credit_line`                  | admin   | n/a         | n/a         | n/a       |
+//! | `Active`       | `Suspended`| `suspend_credit_line`               | admin   | ✓           | ✓           | ✓         |
+//! | `Active`       | `SelfSuspended` | `self_suspend_credit_line`     | borrower | ✓ (elsewhere) | ✓ (elsewhere) | ✓ (elsewhere) |
+//! | `Active`       | `Restricted`| `update_risk_parameters` (limit cut)| admin   | ✓ (elsewhere) | ✓ (elsewhere) | ✓ (elsewhere) |
+//! | `Active`       | `Defaulted`| `default_credit_line`               | admin   | ✓           | ✓           | ✓         |
+//! | `Active`       | `Closed`   | `close_credit_line`                 | admin / borrower | ✓ | ✓ (admin)  | ✓ (admin) |
+//! | `Restricted`   | `Active`   | `update_risk_parameters` (auto-cure)| admin  | ✓ (elsewhere) | ✓ (elsewhere) | ✓ (elsewhere) |
+//! | `Restricted`   | `Defaulted`| `default_credit_line`               | admin   | ✓ (elsewhere) | ✓ (elsewhere) | ✓ (elsewhere) |
+//! | `Restricted`   | `Closed`   | `close_credit_line`                 | admin   | ✓ (elsewhere) | ✓ (elsewhere) | ✓ (elsewhere) |
+//! | `Suspended`    | `Active`   | `unsuspend_credit_line`             | admin   | ✓ (reopen)  | ✓ (reopen)  | ✓ (reopen)|
+//! | `Suspended`    | `Defaulted`| `default_credit_line`               | admin   | ✓           | ✓           | ✓         |
+//! | `Suspended`    | `Closed`   | `close_credit_line`                 | admin   | ✓ (ok)      | ✓ (admin)   | ✓ (admin) |
+//! | `SelfSuspended`| `Active`   | `self_unsuspend_credit_line` / `unsuspend_credit_line` | borrower / admin | ✓ (elsewhere) | ✓ (here)   | ✓ (elsewhere) |
+//! | `SelfSuspended`| `Defaulted`| `default_credit_line`               | admin   | ✓ (elsewhere) | ✓ (elsewhere) | ✓ (elsewhere) |
+//! | `SelfSuspended`| `Closed`   | `close_credit_line`                 | admin   | ✓ (elsewhere) | ✓ (elsewhere) | ✓ (elsewhere) |
+//! | `Defaulted`    | `Active`   | `reinstate_credit_line(Active)`      | admin   | ✓           | ✓           | ✓         |
+//! | `Defaulted`    | `Restricted`| `reinstate_credit_line(Restricted)` | admin   | ✓ (below)   | ✓ (below)   | ✓ (below) |
+//! | `Defaulted`    | `Closed`   | `close_credit_line`                 | admin   | ✓ (ok)      | ✓ (admin)   | ✓ (admin) |
+//! | `Defaulted`    | `Closed`   | `settle_default_liquidation`        | admin   | ✓ (elsewhere) | ✓ (elsewhere) | ✓ (elsewhere) |
+//! | any non-`Active` | `Active` | `open_credit_line` (re-open)        | admin   | ✓ (elsewhere) | ✓ (elsewhere) | ✓ (elsewhere) |
+//! | `Closed`       | `Closed`   | `close_credit_line`                 | admin   | ✗ (stale)   | ✗ (stale)   | ✗ (stale) |
+//!
+//! "elsewhere" marks an edge covered by a dedicated suite rather than by the
+//! matrix below, so that this file's shared harness stays small:
+//!
+//! - `SelfSuspended` edges — `tests/borrower_self_suspend.rs`, which also
+//!   pins the actor split on the way out: the borrower clears their own
+//!   suspension but not an admin one, and the admin clears either
+//!   (`test_borrower_can_self_unsuspend_own_line`,
+//!   `test_borrower_cannot_self_unsuspend_admin_suspension`,
+//!   `test_admin_can_unsuspend_self_suspended_line`)
+//! - `Restricted` edges — `tests/restricted_status.rs`
+//! - settlement to `Closed` — `tests/credit_auction_e2e.rs`
+//! - re-open via `open_credit_line` — `tests/duplicate_open_policy.rs`
+//! - stale and wrong-source rejections — `tests/stale_state_transitions.rs`
 //!
 //! # Accounting invariant
 //! For every transition: `total_debt == principal + accrued_interest`
@@ -26,10 +59,10 @@
 //! - Suspend is admin-only and only valid from Active.
 //! - All invariant assertions run before AND after every transition.
 
-use creditra_credit::types::{CreditLineData, CreditStatus};
+use creditra_credit::types::{ContractError, CreditLineData, CreditStatus};
 use creditra_credit::{Credit, CreditClient};
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{token, Address, Env};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -61,13 +94,20 @@ fn assert_accounting_invariant(line: &CreditLineData, label: &str) {
     );
 }
 
-/// Minimal contract setup: returns (env, admin, contract_id, client).
+/// Minimal contract setup: returns (env, admin, contract_id).
 fn setup_env() -> (Env, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let contract_id = env.register(Credit, ());
-    CreditClient::new(&env, &contract_id).init(&admin);
+    let client = CreditClient::new(&env, &contract_id);
+    client.init(&admin);
+
+    let token_id = env.register_stellar_asset_contract_v2(Address::generate(&env));
+    let tok = token_id.address();
+    client.set_liquidity_token(&tok);
+    token::StellarAssetClient::new(&env, &tok).mint(&contract_id, &100_000_000_i128);
+
     (env, admin, contract_id)
 }
 
@@ -349,15 +389,19 @@ fn transition_cases() -> Vec<TransitionCase> {
             expect_ok: false,
             borrower_closes: true,
         },
-        // ── Closed → Closed (idempotent) ─────────────────────────────────────
+        // ── Closed → Closed (stale, not idempotent) ─────────────────────────
+        // Issue #1146 replaced the silent idempotent return with a typed
+        // StaleStateTransition so a duplicate close is diagnosable.
+        // `stale_state_transitions::close_retry_is_deterministically_stale`
+        // pins the exact discriminant.
         TransitionCase {
-            label: "Closed→Closed: idempotent admin close",
+            label: "Closed→Closed: stale close MUST FAIL",
             credit_limit: 1_000,
             draw_amount: 0,
             advance_seconds: 0,
             from: CreditStatus::Closed,
             to: CreditStatus::Closed,
-            expect_ok: true,
+            expect_ok: false,
             borrower_closes: false,
         },
         // ── Illegal transitions ───────────────────────────────────────────────
@@ -678,6 +722,81 @@ fn reinstate_only_valid_from_defaulted() {
     }
 }
 
+// ── reinstate target_status coverage (#task/reinstate-target-status-tests) ───
+
+/// Defaulted → Active: the canonical reinstate path.
+/// Debt and interest are unchanged; status flips to Active.
+#[test]
+fn reinstate_defaulted_to_active() {
+    let (env, _admin, contract_id) = setup_env();
+    let client = CreditClient::new(&env, &contract_id);
+    let borrower = open_line(&env, &contract_id, 1_000, 500);
+
+    client.default_credit_line(&borrower);
+    assert_eq!(
+        client.get_credit_line(&borrower).unwrap().status,
+        CreditStatus::Defaulted
+    );
+
+    client.reinstate_credit_line(&borrower, &CreditStatus::Active);
+    let line = client.get_credit_line(&borrower).unwrap();
+
+    assert_eq!(line.status, CreditStatus::Active);
+    assert_accounting_invariant(&line, "reinstate to Active");
+}
+
+/// Defaulted → Restricted: valid when the admin wants to cap draws while
+/// requiring the borrower to repay the excess balance first.
+#[test]
+fn reinstate_defaulted_to_restricted() {
+    let (env, _admin, contract_id) = setup_env();
+    let client = CreditClient::new(&env, &contract_id);
+    let borrower = open_line(&env, &contract_id, 1_000, 500);
+
+    client.default_credit_line(&borrower);
+    let before = client.get_credit_line(&borrower).unwrap();
+    assert_eq!(before.status, CreditStatus::Defaulted);
+
+    client.reinstate_credit_line(&borrower, &CreditStatus::Restricted);
+    let line = client.get_credit_line(&borrower).unwrap();
+
+    assert_eq!(line.status, CreditStatus::Restricted);
+    // Debt must be preserved — reinstate never alters balances.
+    assert_eq!(line.utilized_amount, before.utilized_amount);
+    assert_eq!(line.accrued_interest, before.accrued_interest);
+    assert_accounting_invariant(&line, "reinstate to Restricted");
+}
+
+/// Reinstating to Closed, Defaulted, or Suspended must revert.
+/// These targets are outside the allowed set per the state-machine spec.
+#[test]
+fn reinstate_invalid_targets_revert() {
+    for bad_target in [
+        CreditStatus::Closed,
+        CreditStatus::Defaulted,
+        CreditStatus::Suspended,
+    ] {
+        let (env, _admin, contract_id) = setup_env();
+        let client = CreditClient::new(&env, &contract_id);
+        let borrower = open_line(&env, &contract_id, 1_000, 0);
+
+        client.default_credit_line(&borrower);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.reinstate_credit_line(&borrower, &bad_target);
+        }));
+        assert!(result.is_err(), "reinstate to {bad_target:?} must revert");
+
+        // Line must remain Defaulted — no partial state change.
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(
+            line.status,
+            CreditStatus::Defaulted,
+            "status must stay Defaulted after failed reinstate to {bad_target:?}"
+        );
+    }
+}
+
 /// Accrued interest is materialized (not lost) when transitioning Active → Suspended.
 /// Verifies the interest-continues-to-accrue-until-checkpoint behaviour.
 #[test]
@@ -715,9 +834,14 @@ fn interest_materialized_on_suspend() {
     assert_eq!(principal, 10_000, "principal must equal original draw");
 }
 
-/// Closing an already-Closed line is idempotent (no panic, no state change).
+/// Closing an already-Closed line reverts with `StaleStateTransition`.
+///
+/// Issue #1146 made close deterministic on a repeat: the pre-#1146 behaviour was
+/// a silent idempotent return, which hid duplicate or retried closes. The
+/// discriminant is pinned in `stale_state_transitions.rs`; this asserts the
+/// state is left untouched.
 #[test]
-fn close_already_closed_is_idempotent() {
+fn close_already_closed_is_stale() {
     let (env, admin, contract_id) = setup_env();
     let client = CreditClient::new(&env, &contract_id);
     let borrower = open_line(&env, &contract_id, 1_000, 0);
@@ -726,8 +850,17 @@ fn close_already_closed_is_idempotent() {
     let first = client.get_credit_line(&borrower).unwrap();
     assert_eq!(first.status, CreditStatus::Closed);
 
-    // Second close must not panic.
-    client.close_credit_line(&borrower, &admin);
+    // Second close must revert with the stale-transition code, not return
+    // silently the way it did before #1146.
+    let result = client.try_close_credit_line(&borrower, &admin);
+    assert!(result.is_err(), "close on a Closed line must revert");
+    assert_eq!(
+        result.err().unwrap().unwrap(),
+        ContractError::StaleStateTransition.into(),
+        "stale close must return StaleStateTransition (60)"
+    );
+
+    // No partial state change.
     let second = client.get_credit_line(&borrower).unwrap();
     assert_eq!(second.status, CreditStatus::Closed);
     assert_eq!(second.utilized_amount, first.utilized_amount);

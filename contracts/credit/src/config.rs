@@ -1,14 +1,118 @@
 // SPDX-License-Identifier: MIT
-//! Config module: contract initialization.
 
-use crate::storage::admin_key;
+//! Contract initialization and configuration helpers.
+//!
+//! # What
+//!
+//! - [`init`] — one-time initialization. Sets the admin address, the
+//!   default liquidity source (the contract's own address), the schema
+//!   version, the initial global accumulators (`CreditLineCount = 0`,
+//!   `TotalUtilized = 0`), and a default minimum collateral ratio of
+//!   15 000 bps (150 %) — i.e. the contract ships in a conservative
+//!   collateral-required mode and is loosened by admin policy.
+//! - [`set_liquidity_token`] — admin sets the SAC / token contract used
+//!   for `transfer` and `transfer_from` operations on draw, repay, and
+//!   collateral movement.
+//! - [`set_liquidity_source`] — admin sets the reserve address that
+//!   funds draws. Defaults to the credit contract's own address; a
+//!   production deployment typically points this at a separate reserve
+//!   pool contract.
+//!
+//! # How
+//!
+//! `init`'s re-init guard checks `Symbol("admin")` presence in instance
+//! storage. A second `init` call reverts with
+//! [`ContractError::AlreadyInitialized`]; the admin address therefore
+//! cannot be overwritten by re-initialization, only by the two-step
+//! rotation in [`crate::lib::propose_admin`] /
+//! [`crate::lib::accept_admin`].
+//!
+//! # Why (deployment-safe defaults)
+//!
+//! Shipping `init` with conservative defaults — 150 % collateral floor,
+//! contract-as-its-own-reserve-source, schema version 1 — means a
+//! freshly deployed contract is immediately safe to attach to a
+//! liquidity token without exposure to the protocol's untuned risk
+//! parameters. The admin then dials in the rate formula, exposure caps,
+//! and so on before opening the first credit line.
+//!
+//! A full working deployment requires:
+//! 1. `init`
+//! 2. `set_liquidity_token` (required for drawing)
+//! 3. `set_liquidity_source` (unsafe default uses contract's own address)
+//! 4. `set_min_collateral_ratio_bps` (optional)
+//! 5. `set_auction_contract` (wiring credit to auction)
+//! 6. `set_factory_contract` (on auction side, wiring back to credit)
+//!
+//! See [`docs/deploy.md`](../../../docs/deploy.md) for the required
+//! deployment sequence, CLI commands, and a smoke test sequence, and
+//! [`docs/EXECUTION_QUALITY.md`](../../../docs/EXECUTION_QUALITY.md) §6
+//! for the full testnet / mainnet checklist.
+
+use crate::auth::require_admin_auth;
+use crate::storage::{admin_key, set_schema_version, DataKey};
 use crate::types::ContractError;
 use soroban_sdk::{Address, Env};
 
+/// Initialize the contract exactly once.
 pub fn init(env: Env, admin: Address) {
-    let key = admin_key(&env);
-    if env.storage().instance().has(&key) {
+    if env.storage().instance().has(&admin_key(&env)) {
         env.panic_with_error(ContractError::AlreadyInitialized);
     }
-    env.storage().instance().set(&key, &admin);
+    env.storage().instance().set(&admin_key(&env), &admin);
+    env.storage()
+        .instance()
+        .set(&DataKey::LiquiditySource, &env.current_contract_address());
+
+    // Initialize global counters and schema marker.
+    env.storage()
+        .instance()
+        .set(&DataKey::CreditLineCount, &0_u32);
+    env.storage()
+        .instance()
+        .set(&DataKey::TotalUtilized, &0_i128);
+    set_schema_version(&env, crate::SCHEMA_VERSION);
+    // Ship a conservative 150 % (15 000 bps) collateral floor on every build.
+    //
+    // This used to be gated behind `cfg(not(test))`, which meant in-crate unit
+    // tests ran with the key unset while integration tests (compiled against the
+    // non-test lib) observed 150 %. The same scenario then behaved differently
+    // depending on where the test lived. The default is now unconditional and
+    // tests that want unsecured draws opt out explicitly with
+    // `set_min_collateral_ratio_bps(0)`.
+    crate::storage::set_min_collateral_ratio_bps(&env, 15000);
+}
+
+/// Sets the token contract used for reserve/liquidity checks and draw transfers.
+///
+/// # Authorization
+/// Requires the configured admin to authorize this call. This setter does not
+/// gate on the global pause flag; pause enforcement happens in the draw/repay
+/// entrypoints that consume the configured token.
+///
+/// # Storage
+/// Writes `token_address` to instance storage under [`DataKey::LiquidityToken`].
+/// Repeated calls overwrite the previous address.
+#[allow(dead_code)]
+pub fn set_liquidity_token(env: Env, token_address: Address) {
+    require_admin_auth(&env);
+    env.storage()
+        .instance()
+        .set(&DataKey::LiquidityToken, &token_address);
+}
+
+/// Sets the address that provides liquidity for draw operations.
+///
+/// # Authorization
+/// Requires the configured admin to authorize this call.
+///
+/// # Behavior
+/// If unset, the contract falls back to its own address as configured during
+/// [`init`]. Repeated calls overwrite the prior reserve address.
+#[allow(dead_code)]
+pub fn set_liquidity_source(env: Env, reserve_address: Address) {
+    require_admin_auth(&env);
+    env.storage()
+        .instance()
+        .set(&DataKey::LiquiditySource, &reserve_address);
 }

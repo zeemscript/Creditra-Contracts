@@ -1,0 +1,594 @@
+# Creditra System Architecture
+
+This document describes the runtime architecture: how the two contracts and
+the off-chain orchestrator are wired together, the call topology, and the
+sequence of events for each core protocol flow. All component names and
+function signatures are anchored in the source.
+
+For the per-module contract surface, see `docs/PROTOCOL_SPEC.md`.
+For the credit-line status machine, see `docs/state-machine.md`.
+For the protocol-level model, see `WHITEPAPER.md`.
+
+---
+
+## 1. Component Diagram
+
+```mermaid
+flowchart LR
+    subgraph OFFCHAIN["Off-chain"]
+        Scorer["Risk Scoring Service<br/>(produces risk_score 0..=100)"]
+        Indexer["Event Indexer<br/>(consumes 'credit/*' topics)"]
+        Orchestrator["Liquidation Orchestrator<br/>(default → init_auction → settle)"]
+        Frontend["Borrower UI<br/>(wallets, txs)"]
+        Admin["Admin Operator<br/>(multisig, ideally)"]
+    end
+
+    subgraph SOROBAN["Soroban Ledger"]
+        Credit["creditra-credit<br/>(contracts/credit/src/lib.rs)"]
+        Auction["gateway-auction<br/>(gateway-contract/.../lib.rs)"]
+        Token["Liquidity Token (SAC)"]
+        Reserve["Liquidity Source (Reserve Address)"]
+        Treasury["Treasury Address"]
+    end
+
+    Frontend -- "draw_credit, repay_credit, deposit_collateral,<br/>self_suspend_credit_line, close_credit_line" --> Credit
+    Admin -- "init, set_*, open_credit_line, update_risk_parameters,<br/>suspend/default/reinstate, set_oracle_config, upgrade" --> Credit
+    Scorer -- "risk_score (via Admin update_risk_parameters)" --> Admin
+    Credit -- "token::Client::transfer<br/>transfer_from" --> Token
+    Credit -- "transfer (draw) / transfer_from (repay)" --> Reserve
+    Credit -- "withdraw_treasury" --> Treasury
+    Credit -- "AuctionClient::settle_default_liquidation<br/>(cross-contract)" --> Auction
+    Credit -- "events: credit/opened, drawn, repay, accrue,<br/>liq_req, liq_setl, ..." --> Indexer
+    Auction -- "events: AUC_CLOSE, BID_RFDN, LIQ_SETL" --> Indexer
+    Orchestrator -- "init_auction, place_bid, close_auction" --> Auction
+    Orchestrator -- "settle_default_liquidation<br/>(after auction closes)" --> Credit
+    Indexer -. "credit/liq_req topic" .-> Orchestrator
+```
+
+**Notes on the topology:**
+
+- The credit contract is the **only** contract that mutates borrower state.
+- The auction contract has no read or write access to the credit contract's
+  state; the handoff is a single asserted cross-contract call.
+- The off-chain orchestrator is *not* a trusted party — it is incentivized by
+  protocol design to call settlement on a closed auction; if it doesn't, the
+  admin can call it directly.
+- The risk-scoring service is, in v1, an off-chain process whose output is
+  pushed on-chain by the admin via `update_risk_parameters`. The path to
+  decentralization is via `docs/default-oracle.md`.
+
+---
+
+## 2. Sequence: Credit-line Origination
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Admin
+    participant Credit as creditra-credit
+    participant Storage as Soroban Persistent Storage
+    participant Indexer
+
+    Admin->>Credit: open_credit_line(borrower, credit_limit, interest_rate_bps, risk_score)
+    Note over Credit: assert_not_paused (lib.rs:181)
+    Note over Credit: require_admin_auth (auth.rs:40)
+    Credit->>Credit: validate_credit_limit_bounds (lifecycle.rs:126)
+    Credit->>Credit: rate_bps <= 10_000, score <= 100
+    Credit->>Storage: read DataKey::CreditLineIdByBorrower(borrower)
+    alt no existing line
+        Credit->>Storage: write CreditLineCount += 1
+        Credit->>Storage: write CreditLineIdByBorrower(borrower) = id
+        Credit->>Storage: write CreditLineBorrowerById(id) = borrower
+    end
+    Credit->>Storage: write CreditLineData { status: Active, last_accrual_ts: now, ... }
+    Credit->>Indexer: emit ("credit","opened") = CreditLineEvent
+```
+
+---
+
+## 3. Sequence: Draw
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Borrower
+    participant Credit as creditra-credit
+    participant Storage as Persistent Storage
+    participant Token as Liquidity Token (SAC)
+    participant Reserve as Liquidity Source
+
+    Borrower->>Credit: draw_credit(borrower, amount)
+    Note over Credit: assert_not_paused
+    Note over Credit: set_reentrancy_guard (storage.rs:316)
+    Credit->>Borrower: require_auth() [host fn]
+    Credit->>Credit: amount > 0 / not frozen / amount <= MaxDrawAmount
+    Credit->>Credit: !is_borrower_blocked
+    Credit->>Storage: get_credit_line(borrower)
+    Credit->>Credit: apply_accrual (accrual.rs:87)
+    Credit->>Credit: draw_status_error: Active|Restricted pass; else revert
+    Credit->>Credit: cooldown: now - LastDrawTs > DrawMinIntervalSeconds
+    Credit->>Credit: utilized + amount via checked_add, then <= credit_limit
+    Credit->>Credit: collateral ratio check (collateral.rs)
+    Credit->>Credit: per-borrower utilization cap
+    Credit->>Credit: global MaxTotalExposure check
+    Credit->>Reserve: token::Client::balance(reserve) >= amount
+    Credit->>Token: transfer(reserve, borrower, amount)   %% external call
+    Note over Credit: reentrancy guard prevents re-entry here
+    Credit->>Storage: persist_credit_line(prev_utilized, line) [adjusts TotalUtilized]
+    Credit->>Storage: set_last_draw_ts(borrower, now)
+    Credit->>Storage: write DrawAudit(borrower, now) = amount
+    Note over Credit: clear_reentrancy_guard
+    Credit-->>Borrower: emit ("credit","drawn") = DrawnEvent
+```
+
+---
+
+## 4. Sequence: Repayment
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Borrower
+    participant Credit as creditra-credit
+    participant Token as Liquidity Token
+    participant Reserve as Liquidity Source
+    participant Storage
+
+    Borrower->>Credit: repay_credit(borrower, amount)
+    Note over Credit: NO pause check (repay always allowed)
+    Note over Credit: set_reentrancy_guard
+    Credit->>Borrower: require_auth()
+    Credit->>Credit: amount > 0; amount <= MaxRepayAmount
+    Credit->>Storage: get_credit_line(borrower)
+    Credit->>Credit: apply_accrual
+    Credit->>Credit: status != Closed
+    Credit->>Credit: effective_repay = min(amount, utilized_amount)
+    Credit->>Credit: interest_repaid = min(effective_repay, accrued_interest)
+    Credit->>Credit: principal_repaid = effective_repay - interest_repaid
+    Credit->>Credit: fee = interest_repaid * protocol_fee_bps / 10000
+    Credit->>Token: transfer_from(borrower, contract, fee)
+    Credit->>Token: transfer_from(borrower, reserve, effective_repay - fee)
+    Credit->>Storage: persist_credit_line (decrements utilized + accrued_interest)
+    Credit->>Storage: advance_repayment_schedule_after_repay (next_due_ts forward)
+    Credit-->>Borrower: emit ("credit","repay") = RepaymentEvent
+    Credit-->>Borrower: emit ("credit","accrue") + ("credit","fee_accrd")
+    Note over Credit: clear_reentrancy_guard
+```
+
+**Why interest-first?** A repayment must reduce the *cost-bearing* component
+of the debt before the principal. Otherwise a borrower making the
+minimum-payment-to-cover-interest would not reduce the principal, and
+amortization would be unpredictable. The split is enforced by
+`contracts/credit/src/lib.rs:437-556` and tested in `tests/protocol_fee.rs`.
+
+---
+
+## 5. Sequence: Default → Auction → Settlement
+
+This is the full cross-contract flow. Each step has a corresponding test in
+`contracts/credit/tests/credit_auction_e2e.rs`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Admin
+    actor Bidder
+    participant Credit as creditra-credit
+    participant Auction as gateway-auction
+    participant Indexer
+    participant Orchestrator
+
+    Admin->>Credit: default_credit_line(borrower)
+    Note over Credit: require_admin_auth, assert_not_paused
+    Credit->>Credit: apply_accrual (capitalize before default)
+    Credit->>Credit: status: {Active|Restricted|Suspended} → Defaulted
+    Credit-->>Indexer: emit ("credit","defaulted")
+    Credit-->>Indexer: emit ("credit","liq_req") = (borrower, utilized_amount)
+    Indexer-->>Orchestrator: notify of liq_req
+
+    Orchestrator->>Auction: init_auction(auction_id, mode, start, end, min_bid, min_inc_bps, dutch_start?, dutch_floor?, dutch_decay?, dutch_step_count?)
+    Auction->>Auction: validate start<end, min_inc<=10000, Dutch invariants + stepped config
+    Auction-->>Indexer: (init events)
+
+    loop English mode: ascending bids until close
+        Bidder->>Auction: place_bid(auction_id, bidder, amount)
+        Auction->>Auction: amount > max(highest_bid, min_bid-1) + ceil(highest*inc/10000)
+        Auction->>Auction: set_reentrancy_guard
+        opt previous bidder exists
+            Auction-->>Indexer: emit BID_RFDN
+            Auction->>Auction: refund prev bidder (token CPI)
+        end
+        Auction->>Auction: highest_bidder/highest_bid := new
+        Auction->>Auction: clear_reentrancy_guard
+    end
+
+    alt End time reached (English)
+        Orchestrator->>Auction: close_auction(auction_id)
+        Auction->>Auction: status := Closed
+        Auction-->>Indexer: emit AUC_CLOSE
+    else Dutch mode: first qualifying bid auto-closes
+        Bidder->>Auction: place_bid (qualifies vs compute_dutch_price using linear or stepped decay)
+        Auction->>Auction: status := Closed (atomic with bid record)
+        Auction-->>Indexer: emit AUC_CLOSE
+    end
+
+    Admin->>Credit: settle_default_liquidation(borrower, recovered_amount, settlement_id, oracle_price)
+    Note over Credit: set_reentrancy_guard, assert_not_paused
+    opt OracleConfig present
+        Credit->>Credit: oracle_price valid, fresh, within deviation
+        Credit->>Credit: persist OracleLastPrice/Ts atomically
+        Credit-->>Indexer: emit ("credit","orc_price")
+    end
+    opt AuctionContract set
+        Credit->>Auction: settle_default_liquidation(settlement_id, credit_addr, borrower)
+        Auction->>Auction: status == Closed, factory-only, replay-protected
+        Auction-->>Indexer: emit LIQ_SETL
+        Auction-->>Credit: return highest_bid (i128)
+        Credit->>Credit: assert return == recovered_amount else InvalidAmount
+    end
+    Credit->>Credit: replay-check (Symbol("liq_seen"), borrower, settlement_id)
+    Credit->>Credit: decrement utilized + accrued_interest pro-rata
+    alt utilized_amount == 0
+        Credit->>Credit: status := Closed; clear RepaymentSchedule
+    end
+    Credit-->>Indexer: emit ("credit","liq_setl") = DefaultLiquidationSettledEvent
+    Note over Credit: clear_reentrancy_guard
+```
+
+**Why two contracts?** The auction is replaceable. The credit contract talks
+to whichever `AuctionContract` address the admin sets, and the settlement
+handshake (`settle_default_liquidation` on both sides, with mutually replay-
+protected markers and a return-value assertion) is the only point of
+coupling. This isolates the credit invariants from changes to auction
+mechanics (e.g. a future sealed-bid or batch-auction implementation).
+
+---
+
+## 6. Credit Line Lifecycle
+
+The full `CreditStatus` transition graph — every edge, its entrypoint, and the
+actor that may drive it — is maintained in one place:
+[`docs/state-machine.md`](./state-machine.md). That page is the normative
+reference; this section only records the invariants that the sequence diagrams
+above rely on.
+
+Two properties of that graph are load-bearing for the rest of this document:
+
+- `apply_accrual` is called **before** every state transition, so interest is
+  materialised at the transition and never double-counted on a retry.
+- `persist_credit_line(prev_utilized, line)` updates the global `TotalUtilized`
+  accumulator atomically with the line write, and the pending-auction counter
+  moves in the same transaction on every entry to and exit from `Defaulted`.
+- `suspension_ts` is monotone non-decreasing; `assert_ts_monotonic` enforces.
+- Settlement uses the `(borrower, settlement_id)` persistent dedup marker.
+- A repeat of any transition reverts with `StaleStateTransition` (60) rather
+  than silently succeeding, so a retried lifecycle call is always diagnosable.
+
+
+---
+
+## 7. Storage & TTL Architecture
+
+```mermaid
+flowchart TB
+    subgraph Instance["Instance storage (hot, always loaded)"]
+        I1["admin / proposed_admin / proposed_at"]
+        I2["paused / reentrancy / DrawsFrozen"]
+        I3["LiquidityToken / LiquiditySource"]
+        I4["MaxDrawAmount / MaxRepayAmount / DrawMinIntervalSeconds"]
+        I5["MinCreditLimit / MaxCreditLimit / MaxTotalExposure"]
+        I6["MinCollateralRatioBps / PenaltySurchargeBps"]
+        I7["ProtocolFeeBps / TreasuryAddress / TreasuryBalance"]
+        I8["rate_cfg / rate_form / grace_cfg"]
+        I9["OracleConfig / OracleLastPrice / OracleLastPriceTs"]
+        I10["AuctionContract / CreditLineCount / TotalUtilized / SchemaVersion"]
+    end
+
+    subgraph Persistent["Persistent storage (per-key TTL)"]
+        P1["CreditLineIdByBorrower(Address) / CreditLineBorrowerById(u32)"]
+        P2["CreditLineData (under id)"]
+        P3["LastDrawTs(Address)"]
+        P4["BlockedBorrower(Address)"]
+        P5["UtilizationCapBps(Address)"]
+        P6["RateFloorBps(Address) / RateCeilingBps(Address)"]
+        P7["RepaymentSchedule(Address)"]
+        P8["CollateralBalance(Address)"]
+        P9["DrawAudit(Address,u64) / DrawReversedAmount(Address,u64)"]
+        P10["(Symbol('liq_seen'), Address, Symbol) [settlement replay]"]
+    end
+
+    TTL["LEDGER_BUMP_THRESHOLD = 1_555_200 (~3 mo)<br/>LEDGER_BUMP_AMOUNT = 3_110_400 (~6 mo)"]
+    Persistent -.-> TTL
+    Instance -.-> TTL
+```
+
+Every persistent read/write goes through the helpers in
+`contracts/credit/src/storage.rs` which call `bump_credit_line_ttl` /
+`bump_instance_ttl` on access. The cadence:
+
+- If remaining TTL drops below `LEDGER_BUMP_THRESHOLD` (~3 months),
+- extend by `LEDGER_BUMP_AMOUNT` (~6 months).
+
+This means active borrowers' data is automatically refreshed; dormant data
+(no activity in ~6 months) expires. The `accrue_batch` keeper hook
+(`lib.rs:1133`, capped at `ACCRUE_BATCH_MAX = 50`) lets an indexer-driven
+worker re-bump dormant lines cheaply.
+
+The auction contract uses shorter TTLs
+(`PERSISTENT_BUMP_AMOUNT = 518_400` ≈ 30 d,
+`PERSISTENT_LIFETIME_THRESHOLD = 120_960` ≈ 7 d) since auctions are
+short-lived by nature.
+
+---
+
+## 8. Cross-contract Call Topology
+
+The credit contract's outward edges:
+
+| Direction | Target | Method | Purpose | Where |
+|---|---|---|---|---|
+| Out | `LiquidityToken` (SAC) | `transfer(from, to, amount)` | Move funds reserve → borrower on draw | `lib.rs:261-424` |
+| Out | `LiquidityToken` (SAC) | `transfer_from(from, to, amount)` | Move funds borrower → contract (fee) and borrower → reserve (principal+interest-fee) on repay | `lib.rs:437-556` |
+| Out | `LiquidityToken` (SAC) | `balance(addr)` | Read reserve balance for the pre-transfer check | `lib.rs:261-424` step 19 |
+| Out | `LiquidityToken` (SAC) | `transfer(contract, treasury, amount)` | Drain fee accumulator | `lib.rs:770` |
+| Out | `LiquidityToken` (SAC) | `transfer(borrower, contract, amount)` | Collateral deposit | `collateral.rs:34` |
+| Out | `LiquidityToken` (SAC) | `transfer(contract, borrower, amount)` | Collateral withdraw / partial release | `collateral.rs:69,partial_release_collateral` |
+| Out | `AuctionContract` | `settle_default_liquidation(auction_id, credit, borrower) -> i128` | Cross-contract settlement | `lib.rs:953` |
+| In  | Admin | All `set_*`, `open_credit_line`, `update_risk_parameters`, etc. | Admin operations | `auth.rs`, all `lib.rs` admin entrypoints |
+| In  | Borrower | `draw_credit`, `repay_credit`, `deposit_collateral`, `withdraw_collateral`, `partial_release_collateral`, `self_suspend_credit_line`, `close_credit_line` (if utilized=0) | Borrower flows | per file |
+| In  | Keeper / indexer | `accrue_batch` (no auth), all read-only queries | Maintenance | `lib.rs:1133` |
+
+Auction contract's outward edges:
+
+| Direction | Target | Method | Purpose |
+|---|---|---|---|
+| Out | Bid token (SAC) | `transfer(contract, prev_bidder, amount)` | Refund prior English bidder under reentrancy guard |
+| Out | Bid token (SAC) | `transfer(contract, winner, amount)` | (claim_auction placeholder; transfer is currently commented in source) |
+| In  | Factory (credit contract) | `settle_default_liquidation(auction_id, credit, borrower)` | One-shot settlement |
+| In  | Bidder | `place_bid(auction_id, bidder, amount)` | Public bid path |
+| In  | Admin | `init_auction`, `close_auction`, `set_factory_contract` | Operator flow |
+| In  | Winner | `claim_auction(auction_id)` | Post-settlement payout |
+
+---
+
+## 9. Trust Boundaries
+
+```mermaid
+flowchart LR
+    subgraph TB1["Trust boundary: borrower wallet"]
+        Borrower["Borrower wallet"]
+    end
+    subgraph TB2["Trust boundary: admin (multisig)"]
+        Admin["Admin"]
+    end
+    subgraph TB3["Trust boundary: protocol (Soroban + WASM)"]
+        Credit
+        Auction
+    end
+    subgraph TB4["Trust boundary: off-chain"]
+        Scorer
+        Orchestrator
+        Indexer
+    end
+    Borrower -- "require_auth verified" --> Credit
+    Admin -- "require_admin_auth, propose+accept rotation" --> Credit
+    Scorer -- "scalar score (admin-pushed)" --> Admin
+    Orchestrator -- "init_auction, place_bid, close_auction" --> Auction
+    Orchestrator -. "settle_default_liquidation (admin-gated)" .-> Credit
+    Credit -- "events" --> Indexer
+    Auction -- "events" --> Indexer
+```
+
+The protocol code trusts:
+1. Soroban host functions (`require_auth`, `env.ledger().timestamp()`,
+   storage ops, deployer).
+2. The `LiquidityToken` honoring the standard token interface.
+3. The admin's good faith **bounded by** the rate cap, exposure cap,
+   rate-change cap, and proposal delay.
+
+The protocol code does **not** trust:
+- The off-chain scorer (the score is treated as a bounded input).
+- The off-chain orchestrator (settlement is replay-protected and the
+  cross-contract return is asserted).
+- Hostile token contracts (reentrancy guard).
+- Untrusted oracle reports (deviation + staleness breaker).
+
+---
+
+## 10. Event Topology (Indexing Surface)
+
+All event topics emitted by both contracts. The off-chain indexer subscribes
+to these topics and reconstructs the protocol's state machine.
+
+| Topic (credit contract) | Payload | When |
+|---|---|---|
+| `("credit","opened")` | `CreditLineEvent` | New line or admin re-open |
+| `("credit","drawn")` | `DrawnEvent` | Successful draw |
+| `("credit","draw_rev")` | `DrawReversedEvent` | Admin reversal |
+| `("credit","repay")` | `RepaymentEvent` | Successful repay |
+| `("credit","accrue")` | `InterestAccruedEvent` | Whenever ΔI > 0 |
+| `("credit","fee_accrd")` | `FeeAccruedEvent` | When protocol fee deducted |
+| `("credit","suspend")` | `CreditLineEvent` | Admin suspend |
+| `("credit","closed")` | `CreditLineEvent` | Borrower or admin close |
+| `("credit","defaulted")` | `CreditLineEvent` | Admin default |
+| `("credit","reinstate")` | `CreditLineEvent` | Admin reinstate |
+| `("credit","liq_req")` | `(Address, i128)` | Default triggers liquidation request |
+| `("credit","liq_setl")` | `DefaultLiquidationSettledEvent` | Settlement applied |
+| `("credit","risk_upd")` | `RiskParametersUpdatedEvent` | `update_risk_parameters` |
+| `("credit","drw_freeze")` | `DrawsFrozenEvent` | Global freeze toggle |
+| `("credit","rate_form")` | `bool` | Rate formula enable/disable |
+| `("credit","paused")` / `("unpaused")` | `bool` | Pause toggle |
+| `("blk_chg",)` | `BorrowerBlockedEvent` | Blocklist change |
+| `("credit","pen_enter")` / `("pen_exit")` | `PenaltyRate*Event` | Delinquency enter/exit |
+| `("credit","col_dep")` / `("col_wit")` | `Collateral*Event` | Collateral movement |
+| `("credit","admin_prop")` / `("admin_acc")` | `AdminRotation*Event` | Admin rotation |
+| `("credit","orc_cfg")` | `(u32, u64)` | Oracle config set |
+| `("credit","orc_price")` | `(i128, u64)` | Oracle price accepted |
+| `("credit","upgraded")` | `ContractUpgradedEvent` | WASM upgrade |
+
+| Topic (auction) | Payload | When |
+|---|---|---|
+| `("AUC_CLOSE", auction_id)` | `AuctionClosedEvent` | Close (manual or Dutch auto) |
+| `("BID_RFDN", auction_id)` | `BidRefundedEvent` | Prior bidder refund (English) |
+| `("LIQ_SETL", auction_id)` | `DefaultLiquidationSettlementEvent` | Settlement from credit factory |
+
+See `docs/indexer-integration.md` for JSON decoding examples.
+
+---
+
+## 11. Custody Model — Collateral, Reserves and Fees
+
+This section answers the question an integrator or auditor asks first: **which
+on-chain balances back which obligations?** Everything below is derived from the
+transfers in `contracts/credit/src/lib.rs` and `contracts/credit/src/collateral.rs`.
+
+### 11.1 Which asset is which
+
+| Concept | Storage | Notes |
+|---|---|---|
+| Liquidity token | `DataKey::LiquidityToken`, written by the admin `set_liquidity_token` entrypoint | The single asset the protocol lends and repays in. Read inline by `draw_credit`, `repay_credit` and the withdrawal paths. |
+| Liquidity reserve | `DataKey::LiquiditySource`, written by the admin `set_liquidity_source` entrypoint (`config::set_liquidity_source`) | The account `draw_credit` pays out of. `config::init` defaults it to `env.current_contract_address()`. |
+| Collateral token | `storage::get_collateral_token()` | **Reads `DataKey::LiquidityToken`** — the canonical collateral asset *is* the liquidity token, so collateral and reserves are the same asset in the default configuration. |
+| Additional collateral tokens | `DataKey::CollateralBalanceV2(borrower, token)` | Opt-in multi-token balances handled by `deposit_collateral_token` / `withdraw_collateral_token` / `get_collateral_for_token`, gated by `DataKey::CollateralTokenAllowlist`. Tracked separately from the canonical `CollateralBalance(borrower)` entry. |
+| Treasury / bounty fees | `DataKey::TreasuryBalance`, `DataKey::BountyBalance` | **Accounting accumulators only** — the tokens themselves sit in the credit contract's own balance of the liquidity token. |
+| Protocol totals | `DataKey::TotalUtilized`, `DataKey::TotalCollateral`, `DataKey::ActiveLineCount` | Derived aggregates kept in sync by `persist_credit_line` / `adjust_total_utilized` / `adjust_total_collateral`. |
+
+Because the collateral token and the liquidity token are the same asset, the
+credit contract's single token balance is the physical custody pool for three
+logically distinct claims: the lending reserve, borrower collateral, and
+accumulated protocol fees.
+
+### 11.2 Token flows
+
+Every entrypoint that moves tokens appears below; entrypoints in *italics* only
+mutate accounting state (no token transfer).
+
+```mermaid
+flowchart TB
+    subgraph Actors
+        BOR[Borrower]
+        ADM[Admin]
+        TRS[Treasury address]
+        BNT[Bounty address]
+        AUC[Auction contract]
+    end
+
+    subgraph Reserve["Liquidity reserve (LiquiditySource)"]
+        RESBAL[(reserve token balance)]
+    end
+
+    subgraph Contract["Creditra credit contract (self-custody pool)"]
+        POOL[(contract token balance<br/>= collateral + fees + reserve, when self-sourced)]
+        LEDGER["Ledger entries<br/>CollateralBalance / CollateralBalanceV2<br/>TreasuryBalance / BountyBalance<br/>TotalUtilized / TotalCollateral"]
+    end
+
+    BOR -- "deposit_collateral / deposit_collateral_token" --> POOL
+    POOL -- "withdraw_collateral / partial_release_collateral<br/>withdraw_collateral_token" --> BOR
+
+    RESBAL -- "draw_credit (transfer reserve → borrower)" --> BOR
+    BOR -- "repay_credit (transfer_from borrower → contract, fee portion)" --> POOL
+    BOR -- "repay_credit (transfer_from borrower → reserve, principal + interest)" --> RESBAL
+
+    POOL -- "withdraw_treasury (admin)" --> TRS
+    POOL -- "withdraw_bounty (admin)" --> BNT
+    POOL -- "execute_treasury_withdrawal (admin, timelocked)" --> TRS
+
+    ADM -. "settle_default_liquidation — no token CPI in the credit contract;<br/>the auction contract returns the recovered amount" .-> AUC
+
+    POOL --- LEDGER
+```
+
+### 11.3 Reserve sourcing: default vs. recommended
+
+`config::init` sets `DataKey::LiquiditySource` to
+`env.current_contract_address()` — i.e. **the credit contract itself is the
+default reserve**. In that configuration `draw_credit` transfers from the
+contract's own token balance, so the pool is a genuinely self-custodial mix of
+reserve + collateral + fees, and the "reserve balance" read at
+`lib.rs` draw time (`token_client.balance(&reserve_address)`) is really the
+whole contract balance.
+
+`set_liquidity_source(reserve_address)` (admin, `config.rs`) points draws at an
+independent reserve account instead. Production deployments are strongly
+encouraged to use this:
+
+* **Segregated liabilities.** Collateral and fee accumulators no longer share a
+  balance with lendable principal, so a collateral shortfall cannot be silently
+  covered by reserve funds (and vice versa).
+* **Cleaner solvency accounting.** The reserve balance is a single quantity that
+  can be compared with `TotalUtilized` without subtracting collateral and fees.
+* **Smaller blast radius.** A bug or a stuck transfer in the collateral path
+  cannot drain the lending reserve.
+
+The default is retained for local/dev deployments where a single funded account
+is convenient; it is not a production recommendation.
+
+### 11.4 Relationship to `get_proof_of_reserve`
+
+`get_proof_of_reserve()` returns `{ treasury_balance, bounty_balance }` — the two
+fee accumulators from storage. It is a **pure storage read**: it does not perform
+any token balance lookup.
+
+Callers must therefore close the loop themselves by comparing the accumulators
+against the contract's real token balance. With the recommended external reserve
+the custody equation is:
+
+```text
+contract_token_balance >= treasury_balance + bounty_balance + total_collateral
+```
+
+With the default self-sourced reserve the contract also holds lendable
+principal, so the equation becomes:
+
+```text
+contract_token_balance >= treasury_balance + bounty_balance + total_collateral
+                          + (undisbursed reserve principal)
+```
+
+and `draw_credit` reduces the contract balance while increasing
+`TotalUtilized`, so an auditor should reconcile
+`contract_token_balance + TotalUtilized - total_collateral - treasury - bounty`
+against the expected reserve rather than treating the raw balance as reserves.
+
+`get_protocol_summary_view()` exposes `total_utilized`, `total_collateral` and
+`active_line_count` in a single read for exactly this reconciliation.
+
+### 11.5 Failure modes
+
+| Condition | Behaviour |
+|---|---|
+| Reserve under-funded for a draw | `draw_credit` fails on the reserve liquidity check before the CPI. |
+| Collateral token not set | `get_collateral_token()` returns `None`; collateral entrypoints that require it fail rather than defaulting to an arbitrary asset. |
+| Non-allowlisted collateral token | `deposit_collateral_token` rejects tokens outside `CollateralTokenAllowlist`. |
+| Treasury/bounty withdraw with insufficient accumulator | Withdrawal is capped by the accumulator, so fees cannot be paid out of collateral or principal. |
+| Settlement recovery shortfall | `settle_default_liquidation` asserts the auction's reported recovery against the admin-supplied `recovered_amount`; the credit contract itself transfers no tokens on this path. |
+
+---
+
+## 12. Support Crates (Test/Indexer)
+
+The `contracts/` directory contains several wrapper crates that are **not deployable smart contracts**. They exist solely to host integration tests, error stability snapshots, or to expose read-only capability bitmaps to off-chain indexers and clients without requiring them to simulate full transactions. These crates mostly re-export logic from the main `creditra-credit` contract.
+
+The wrapper crates include:
+- `creditra-accrual`: Error stability tests and gas snapshots for accrual logic.
+- `creditra-borrow`: Error stability tests for the borrow/draw/repay surface.
+- `creditra-freeze`: Authentication boundary tests for freeze operations.
+- `creditra-lifecycle`: Read-only bitmap reporting permitted lifecycle transitions.
+- `creditra-query`: Read-only bitmap reporting borrower-scoped query capabilities.
+
+---
+
+## 13. References
+
+- `contracts/credit/src/lib.rs` — all entrypoints
+- `contracts/credit/src/lifecycle.rs` — state machine implementation
+- `contracts/credit/src/accrual.rs` — accrual fold
+- `contracts/credit/src/storage.rs` — storage abstraction & TTL
+- `gateway-contract/contracts/auction_contract/src/lib.rs` — auction
+- `docs/PROTOCOL_SPEC.md` — per-entrypoint contract surface
+- `docs/state-machine.md` — **canonical** `CreditStatus` transition graph and
+  the repayment-schedule machine
+- `docs/storage-layout.md` — storage tier reference
+- `docs/threat-model.md` — authorization matrix
+- `docs/indexer-integration.md` — event decoding
+- `docs/default-liquidation-auction-hook.md` — handoff details

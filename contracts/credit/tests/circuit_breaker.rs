@@ -454,6 +454,118 @@ fn unpause_when_already_unpaused_is_idempotent() {
     assert!(!client.is_protocol_paused());
 }
 
+// ── transition observability & idempotency ─────────────────────────────────
+
+#[test]
+fn pause_noop_emits_no_event() {
+    let (env, _admin, contract_id) = setup();
+    let client = CreditClient::new(&env, &contract_id);
+
+    client.set_protocol_paused(&true);
+    assert!(client.is_protocol_paused());
+    let _ = env.events().all(); // clear
+
+    // Redundant pause while already paused — must be a no-op with no event.
+    client.set_protocol_paused(&true);
+    assert!(
+        env.events().all().is_empty(),
+        "no-op pause must not emit a duplicate paused event"
+    );
+    assert!(client.is_protocol_paused());
+}
+
+#[test]
+fn unpause_noop_emits_no_event() {
+    let (env, _admin, contract_id) = setup();
+    let client = CreditClient::new(&env, &contract_id);
+
+    assert!(!client.is_protocol_paused());
+    let _ = env.events().all(); // clear
+
+    // Redundant unpause while already unpaused — must be a no-op with no event.
+    client.set_protocol_paused(&false);
+    assert!(
+        env.events().all().is_empty(),
+        "no-op unpause must not emit a duplicate unpaused event"
+    );
+    assert!(!client.is_protocol_paused());
+}
+
+#[test]
+fn real_transition_after_noop_reemits_event() {
+    let (env, _admin, contract_id) = setup();
+    let client = CreditClient::new(&env, &contract_id);
+
+    // Genuine transition: unpaused -> paused
+    client.set_protocol_paused(&true);
+    assert_eq!(env.events().all().len(), 1, "pause must emit one event");
+    let _ = env.events().all();
+
+    // No-op pause: no event
+    client.set_protocol_paused(&true);
+    assert!(env.events().all().is_empty());
+    let _ = env.events().all();
+
+    // Genuine transition: unpause -> emits
+    client.set_protocol_paused(&false);
+    assert_eq!(env.events().all().len(), 1, "unpause must emit one event");
+    let _ = env.events().all();
+
+    // Genuine transition again: pause -> emits
+    client.set_protocol_paused(&true);
+    assert_eq!(env.events().all().len(), 1, "re-pause must emit one event");
+}
+
+#[test]
+fn reasonless_repause_clears_stale_reason_without_event() {
+    let (env, _admin, contract_id) = setup();
+    let client = CreditClient::new(&env, &contract_id);
+
+    let reason = soroban_sdk::Symbol::new(&env, "oracle-outage");
+    client.set_protocol_paused_with_reason(&true, &reason);
+    assert!(client.get_protocol_pause_reason().is_some());
+    let _ = env.events().all();
+
+    // Reason-less pause while already paused: clear stale reason, no event.
+    client.set_protocol_paused(&true);
+    assert!(
+        client.get_protocol_pause_reason().is_none(),
+        "reason-less re-pause must clear the stale reason"
+    );
+    assert!(
+        env.events().all().is_empty(),
+        "reason-less re-pause must not emit a duplicate event"
+    );
+}
+
+#[test]
+fn repeated_pause_with_reason_refreshes_reason_but_not_event() {
+    let (env, admin, contract_id) = setup();
+    let client = CreditClient::new(&env, &contract_id);
+
+    client.set_protocol_paused_with_reason(&true, &soroban_sdk::Symbol::new(&env, "first"));
+    let original = client.get_protocol_pause_reason().unwrap();
+    assert_eq!(original.actor, admin);
+    let _ = env.events().all();
+
+    // Advance the ledger timestamp so a refresh is observable.
+    env.ledger().with_mut(|l| l.timestamp += 100);
+
+    // Repeated pause-with-reason: reason is refreshed, no duplicate event.
+    client.set_protocol_paused_with_reason(&true, &soroban_sdk::Symbol::new(&env, "second"));
+    assert!(
+        env.events().all().is_empty(),
+        "repeated pause-with-reason must not emit a duplicate event"
+    );
+
+    let refreshed = client.get_protocol_pause_reason().unwrap();
+    assert_eq!(refreshed.reason, soroban_sdk::Symbol::new(&env, "second"));
+    assert!(
+        refreshed.timestamp > original.timestamp,
+        "reason timestamp must refresh to the latest pause invocation"
+    );
+}
+
 // ── operations resume after unpause ──────────────────────────────────────────
 
 #[test]
@@ -478,4 +590,117 @@ fn operations_resume_after_unpause() {
     client.open_credit_line(&borrower, &1_000, &300, &50);
     let line = client.get_credit_line(&borrower).unwrap();
     assert_eq!(line.credit_limit, 1_000);
+}
+
+// ── pause with reason (escape-hatch audit trail) ─────────────────────────
+
+#[test]
+fn pause_with_reason_stores_reason() {
+    let (env, _admin, contract_id) = setup();
+    let client = CreditClient::new(&env, &contract_id);
+
+    assert!(!client.is_protocol_paused());
+
+    let reason = soroban_sdk::Symbol::new(&env, "oracle-outage");
+    client.set_protocol_paused_with_reason(&true, &reason);
+
+    assert!(client.is_protocol_paused());
+
+    let stored = client.get_protocol_pause_reason();
+    assert!(stored.is_some(), "pause reason must be stored");
+    let pause_reason = stored.unwrap();
+    assert_eq!(pause_reason.reason, reason);
+}
+
+#[test]
+fn pause_with_reason_unpause_clears_reason() {
+    let (env, _admin, contract_id) = setup();
+    let client = CreditClient::new(&env, &contract_id);
+
+    let reason = soroban_sdk::Symbol::new(&env, "token-migration");
+    client.set_protocol_paused_with_reason(&true, &reason);
+    assert!(client.get_protocol_pause_reason().is_some());
+
+    // Unpause — reason should be cleared
+    client.set_protocol_paused_with_reason(&false, &reason);
+    assert!(!client.is_protocol_paused());
+    assert!(
+        client.get_protocol_pause_reason().is_none(),
+        "reason must be cleared on unpause"
+    );
+}
+
+#[test]
+fn pause_without_reason_has_no_stored_reason() {
+    let (env, _admin, contract_id) = setup();
+    let client = CreditClient::new(&env, &contract_id);
+
+    // Use the reason-less pause
+    client.set_protocol_paused(&true);
+    assert!(client.is_protocol_paused());
+
+    // No reason should be stored
+    let stored = client.get_protocol_pause_reason();
+    assert!(
+        stored.is_none(),
+        "reason-less pause must not store a reason"
+    );
+}
+
+#[test]
+fn later_reasonless_pause_clears_stale_reason() {
+    let (env, _admin, contract_id) = setup();
+    let client = CreditClient::new(&env, &contract_id);
+
+    let reason = soroban_sdk::Symbol::new(&env, "oracle-outage");
+    client.set_protocol_paused_with_reason(&true, &reason);
+    assert!(client.get_protocol_pause_reason().is_some());
+
+    client.set_protocol_paused(&true);
+    assert!(client.is_protocol_paused());
+    assert!(
+        client.get_protocol_pause_reason().is_none(),
+        "a later reason-less pause must clear any stale reason"
+    );
+}
+
+#[test]
+fn pause_with_reason_records_timestamp_and_actor() {
+    let (env, admin, contract_id) = setup();
+    let client = CreditClient::new(&env, &contract_id);
+
+    let reason = soroban_sdk::Symbol::new(&env, "maintenance");
+    client.set_protocol_paused_with_reason(&true, &reason);
+
+    let stored = client.get_protocol_pause_reason().unwrap();
+    assert!(stored.timestamp > 0, "timestamp must be recorded");
+    assert_eq!(stored.actor, admin, "actor must be the admin");
+}
+
+#[test]
+fn get_protocol_pause_reason_works_when_paused() {
+    let (env, _admin, contract_id) = setup();
+    let client = CreditClient::new(&env, &contract_id);
+
+    // No reason before pause
+    assert!(client.get_protocol_pause_reason().is_none());
+
+    let reason = soroban_sdk::Symbol::new(&env, "emergency");
+    client.set_protocol_paused_with_reason(&true, &reason);
+
+    // Reason available after pause-with-reason
+    assert!(client.get_protocol_pause_reason().is_some());
+}
+
+#[test]
+#[should_panic]
+fn pause_with_reason_requires_admin() {
+    let (env, _admin, contract_id) = setup();
+    env.mock_all_auths_allowing_non_root_auth();
+    let non_admin = Address::generate(&env);
+    let client = CreditClient::new(&env, &contract_id);
+
+    non_admin.require_auth();
+    let reason = soroban_sdk::Symbol::new(&env, "bad-actor");
+    client.set_protocol_paused_with_reason(&true, &reason);
 }

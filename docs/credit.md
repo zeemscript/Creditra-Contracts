@@ -26,6 +26,16 @@ Stored in persistent storage keyed by the borrower's address.
 | `accrued_interest`   | `i128`   | Cumulative capitalized interest recorded on the line |
 | `last_accrual_ts`    | `u64`    | Ledger timestamp of the last interest accrual checkpoint (0 = never accrued) |
 
+### `RepaymentSchedule`
+
+Optional per-borrower installment schedule stored in persistent storage under the borrower address.
+
+| Field | Type | Description |
+|---|---|---|
+| `amount_per_period` | `i128` | Required principal amount for each installment; interest-only repayment does not advance the schedule |
+| `period_seconds` | `u64` | Installment interval in seconds |
+| `next_due_ts` | `u64` | Timestamp for the next installment due date |
+
 ### `RateChangeConfig`
 Stored in instance storage under the `"rate_cfg"` key. Optional — when absent, no rate-change limits are enforced.
 
@@ -72,6 +82,18 @@ call for the same borrower address starts a fresh record and resets all fields.
 | Defaulted  | ❌ Blocked     | ✅ Allowed      |
 | Closed     | ❌ Blocked     | ❌ Blocked      |
 | Restricted | ❌ Blocked     | ✅ Allowed      |
+
+## Soroban Atomicity Guarantees
+
+The Credit contract relies on Soroban's transaction atomicity guarantees for state consistency:
+
+- **Atomic execution**: All operations within a single contract call either succeed completely or fail completely. Partial state changes are impossible.
+- **Token transfer safety**: External token contract calls (e.g., `transfer`, `transfer_from`) are integrated into the atomic transaction. If a token transfer fails, all storage updates are rolled back.
+- **Reentrancy protection**: A reentrancy guard is set at the start of `draw_credit` and `repay_credit` and cleared at the end. If the transaction fails (e.g., due to token transfer failure), the guard is automatically rolled back, preventing stuck guards.
+- **Ordering**: Token transfers occur before storage updates in both `draw_credit` and `repay_credit`. This ensures that failed transfers do not leave inconsistent utilization state.
+- **No inconsistent states**: Failures never result in updated `utilized_amount` without corresponding token movement, or vice versa.
+
+These guarantees ensure that the contract maintains invariants even under adversarial token contract behavior or unexpected failures.
 
 ## Methods
 
@@ -164,12 +186,14 @@ Draw funds from an **Active** credit line. Only the borrower is authorized to ca
 
 - Reverts with `ContractError::Unauthorized` (1) if caller is not the borrower.
 - Reverts with `ContractError::CreditLineNotFound` (3) if no line exists.
-- Reverts with `ContractError::CreditLineSuspended` (18), `ContractError::CreditLineDefaulted` (19), or `ContractError::CreditLineClosed` (4) based on status.
+- Reverts with `ContractError::CreditLineSuspended` (20), `ContractError::CreditLineDefaulted` (21), or `ContractError::CreditLineClosed` (4) based on status.
 - Reverts with `ContractError::InvalidAmount` (5) if `amount <= 0`.
 - Reverts with `ContractError::Overflow` (12) on arithmetic overflow.
-- Reverts with `ContractError::DrawCooldownActive` (20) when a borrower attempts to draw again before the configured cooldown interval has elapsed.
+- Reverts with `ContractError::DrawCooldownActive` (29) when a borrower attempts to draw again before the configured cooldown interval has elapsed.
 - Reverts with `ContractError::OverLimit` (6) if draw exceeds `credit_limit`.
-- Transfers tokens from liquidity source → borrower.
+- Reverts with `ContractError::InsufficientLiquidityReserve` (24) if the configured reserve balance is lower than the requested draw amount.
+- Transfers tokens from liquidity source → borrower **before** updating storage. If the transfer fails, the call reverts with no state change due to Soroban transaction atomicity.
+- Updates `utilized_amount` and sets draw timestamp after successful transfer.
 
 Emits: `("credit", "drawn")` event.
 
@@ -197,7 +221,7 @@ Repay outstanding drawn funds.
 5. **Update state** — `accrued_interest` and `utilized_amount` are reduced accordingly.
 
 - The borrower must have approved the contract to pull tokens via `transfer_from`.
-- Tokens are transferred **before** state is updated. If the transfer fails, the call reverts with no state change.
+- Tokens are transferred **before** state is updated. If the transfer fails, the call reverts with no state change due to Soroban transaction atomicity.
 - Repayment failures due to insufficient allowance or balance do not alter `utilized_amount`, `accrued_interest`, or the credit line record.
 - Works even when no liquidity token is configured (state-only update).
 
@@ -207,6 +231,26 @@ Emits: `("credit", "repay")` event with `RepaymentEvent` payload containing:
 - `principal_repaid` — portion applied to principal
 - `new_utilized_amount` — total outstanding debt after repayment
 - `new_accrued_interest` — remaining interest debt after repayment
+
+### `set_repayment_schedule(env, borrower, amount_per_period, period_seconds, first_due_ts)`
+Sets or replaces the installment schedule for a borrower credit line. Admin only.
+
+- `amount_per_period` must be positive.
+- `period_seconds` must be positive.
+- The schedule is cleared automatically when the line is reopened or closed.
+
+### `set_borrower_exposure_cap(env, borrower, amount)`
+Set the maximum outstanding exposure permitted for a borrower across all active credit lines. Admin only.
+
+- `amount = 0` removes the cap.
+- Negative values revert with `ContractError::InvalidAmount`.
+- The cap is checked during `draw_credit` against the borrower's post-draw utilized balance.
+
+### `get_borrower_exposure_cap(env, borrower) -> Option<i128>`
+Returns the configured borrower exposure cap, if any.
+
+### `is_delinquent(env, borrower)`
+Returns `true` when a borrower has a repayment schedule, still has debt, and the current time is past `next_due_ts + grace_period_seconds`.
 
 Integrators can reconcile balances using:
 - `principal_owed = new_utilized_amount - new_accrued_interest`
@@ -218,6 +262,12 @@ Update credit limit, interest rate, and risk score (admin only).
 When `RateChangeConfig` is set, rate changes are subject to:
 - Maximum delta ≤ `max_rate_change_bps`
 - Minimum time interval ≥ `rate_change_min_interval`
+- The interval is enforced only when the effective rate actually changes.
+- On a successful rate change, `last_rate_update_ts` is refreshed to the current ledger timestamp.
+
+If `RateChangeConfig` is absent, `update_risk_parameters` retains the previous
+backward-compatible behavior and accepts any manual rate that stays within the
+global `MAX_INTEREST_RATE_BPS` cap.
 
 #### Credit Limit Decrease Behavior
 
@@ -254,6 +304,12 @@ Configure rate-change limits (admin only).
 
 ### `get_rate_change_limits(env) -> Option<RateChangeConfig>`
 Returns the current rate-change configuration (or `None` if not set).
+
+### Security notes for `update_risk_parameters`
+- Admin auth is required before any mutation.
+- The borrower record must already exist; missing lines fail with `CreditLineNotFound`.
+- Rate-change limits are optional and only affect successful rate changes.
+- Calls that fail validation leave the credit line unchanged, including `last_rate_update_ts`.
 
 ### `get_schema_version(env) -> Option<u32>`
 Returns the stored storage schema version from instance storage.
@@ -416,25 +472,94 @@ Interest accrual is lazy. `accrued_interest` and `utilized_amount` reflect the l
 - Safe to call from untrusted contexts; the worst outcome is a stale accrual snapshot (see accrual note above).
 - Returns `None` for addresses that have never had a credit line; callers must handle this case.
 
-### `freeze_draws(env)`
+### `get_credit_line_count(env) -> u64`
+View function — returns the total number of credit lines that have been opened.
+
+### `get_health_factor(env, borrower) -> u32`
+View function — returns the borrower's collateral-aware health factor in basis points (bps).
+
+- Returns `u32::MAX` when `utilized_amount <= 0` (no outstanding debt → infinitely healthy).
+- A value of `10_000` bps (100%) represents a position whose collateral exactly satisfies the configured minimum collateral ratio (`MinCollateralRatioBps`, defaulting to `15_000` bps / 150%).
+- Values strictly below `10_000` indicate nominal under-collateralization relative to the minimum ratio.
+- **Excluded inputs & blind spots**: Evaluates only the single deposited collateral balance; ignores multi-token collateral, asset-specific risk weights / haircuts, oracle price feeds (assumes 1:1 nominal parity with debt token), installment schedule delinquency ([`is_delinquent`](#is_delinquentenv-borrower)), and uncheckpointed pending interest.
+- **Administrative default**: `default_credit_line` does **not** check or enforce `get_health_factor` on-chain. Defaults are administrative actions.
+- See [Keeper Integration and Default Eligibility](#keeper-integration-and-default-eligibility) for operational guidelines, recommended keeper evaluation flow, and example action thresholds.
+
+### `enumerate_credit_lines(env, start_after, limit) -> Vec<(u64, CreditLineData)>`
+View function — returns a paginated list of credit lines in insertion order.
+
+#### Parameters
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `start_after` | `Option<u64>` | Credit line ID to start after (exclusive). Pass `None` to start from the beginning. |
+| `limit` | `u32` | Number of entries to return (capped at 100). |
+
+#### Example
+```rust
+// Get first 10 credit lines
+let page1 = client.enumerate_credit_lines(&None, &10);
+
+// Get next page using last ID
+if let Some((last_id, _)) = page1.last() {
+    let page2 = client.enumerate_credit_lines(&Some(*last_id), &10);
+}
+```
+
+- **Access**: Public (no authorization required).
+- **Ordering**: Insertion order (sequential IDs assigned at creation).
+- **Gas limit**: `limit` is capped at 100 to prevent gas exhaustion.
+
+### `freeze_draws(env, reason)`
 Freeze all `draw_credit` calls contract-wide (admin only).
 
-- Sets `DataKey::DrawsFrozen` to `true` in instance storage.
+- Sets `DataKey::DrawsFrozen` to [`DrawsFreezeState { frozen: true, reason }`] in instance storage.
+- `reason` must be a [`FreezeReason`] variant for structured audit/indexer classification.
 - Does **not** mutate any borrower's `CreditStatus`; lines remain Active, Defaulted, etc.
 - Repayments are never blocked by this flag.
-- Idempotent: calling when already frozen still emits the event.
 
-Emits: `("credit", "drw_freeze")` with `DrawsFrozenEvent { frozen: true, timestamp, actor }`.
+Emits: `("credit", "drw_freeze")` with `DrawsFrozenEvent { frozen: true, reason }`.
 
 ### `unfreeze_draws(env)`
 Re-enable `draw_credit` after a global freeze (admin only).
 
-- Sets `DataKey::DrawsFrozen` to `false` in instance storage.
-- Idempotent: calling when already unfrozen still emits the event.
+- Sets `DrawsFreezeState.frozen` to `false` while preserving the last recorded reason.
+- Emits: `("credit", "drw_freeze")` with `DrawsFrozenEvent { frozen: false, reason }`.
 
-Emits: `("credit", "drw_freeze")` with `DrawsFrozenEvent { frozen: false, timestamp, actor }`.
+### `get_draws_freeze_reason(env) -> Option<FreezeReason>`
+Returns the structured reason for the active global draw freeze. Returns `None` when draws are not frozen. No auth required.
 
-### `set_draw_min_interval(env, seconds)`
+### `freeze_credit_line(env, borrower, reason)`
+Freeze draws for a single credit line (admin only).
+
+- Records `reason` under `DataKey::CreditLineFreeze(Address)` in persistent storage.
+- Does **not** change `CreditStatus`; distinct from `suspend_credit_line`.
+- Repayments remain available.
+- Reverts with `CreditLineNotFound` when no line exists.
+
+Emits: `("credit", "line_frz")` with `CreditLineFreezeEvent { borrower, reason, frozen: true, ledger }`.
+
+### `unfreeze_credit_line(env, borrower)`
+Lift a per-credit-line draw freeze (admin only). No-op when not frozen.
+
+Emits: `("credit", "line_frz")` with `frozen: false` when a freeze record existed.
+
+### `is_credit_line_frozen(env, borrower) -> bool`
+Returns `true` when the borrower's credit line has an active admin freeze. No auth required.
+
+### `get_credit_line_freeze_reason(env, borrower) -> Option<FreezeReason>`
+Returns the structured freeze reason for a credit line, if frozen. No auth required.
+
+#### `FreezeReason` taxonomy
+
+| Variant | Value | Intended use |
+|---------|-------|--------------|
+| `LiquidityReserve` | 0 | Scheduled reserve / treasury operations |
+| `Compliance` | 1 | Regulatory or compliance-mandated pause |
+| `RiskInvestigation` | 2 | Active risk investigation or off-chain signal |
+| `OperationalMaintenance` | 3 | Planned maintenance window |
+| `BorrowerRequest` | 4 | Borrower-initiated voluntary draw pause |
+
+### `is_draws_frozen(env) -> bool`
 Set the per-borrower draw cooldown interval in seconds (admin only).
 
 - `seconds > 0` enforces a minimum interval between successful draws for every borrower.
@@ -442,8 +567,35 @@ Set the per-borrower draw cooldown interval in seconds (admin only).
 - This setting is optional and defaults to disabled when unset.
 - It affects only `draw_credit`; `repay_credit` remains available regardless of the cooldown.
 
+### `set_borrow_admin_cooldown(env, seconds)`
+Set the per-borrower cooldown interval between critical admin actions.
+
+- Admin only.
+- `seconds > 0` enforces a minimum interval between borrower-specific admin mutations such as `open_credit_line`, `update_risk_parameters`, `suspend_credit_line`, `default_credit_line`, `reinstate_credit_line`, `forgive_debt`, admin `close_credit_line`, borrower freeze, and credit-line freeze changes.
+- `seconds = 0` disables the admin-action cooldown.
+- The cooldown is per borrower, so actions on one borrower do not block actions on another borrower.
+- Reverts with `ContractError::AdminCooldownActive` (`54`) when a critical admin action is attempted before the interval has elapsed.
+
+### `get_borrow_admin_cooldown(env) -> Option<u64>`
+Returns the configured per-borrower admin-action cooldown, if set. No auth required.
+
+### `set_accrual_admin_cooldown(env, seconds)`
+Set the per-borrower cooldown interval between accrual-critical admin actions.
+
+- Admin only.
+- `seconds > 0` enforces a minimum interval between borrower-specific admin actions that realize or mutate accrued debt state, currently `update_risk_parameters`, `suspend_credit_line`, admin `close_credit_line`, `close_credit_lines_batch`, `default_credit_line`, `reinstate_credit_line`, and `forgive_debt`.
+- `seconds = 0` disables the accrual admin cooldown.
+- The cooldown is per borrower, so accrual-critical actions on one borrower do not block another borrower.
+- Reverts with `ContractError::AdminCooldownActive` (`54`) when an accrual-critical admin action is attempted before the interval has elapsed.
+- This cooldown is independent from `set_borrow_admin_cooldown`, which continues to gate borrow/origination-side critical admin actions such as `open_credit_line`.
+
+### `get_accrual_admin_cooldown(env) -> Option<u64>`
+Returns the configured per-borrower accrual admin-action cooldown, if set. No auth required.
+
 ### `is_draws_frozen(env) -> bool`
 Returns `true` when draws are globally frozen. Defaults to `false` when the key has never been set. No auth required.
+
+**Note for contributors**: On a freshly initialized contract (before any `freeze_draws` call), `is_draws_frozen` returns `false` by default. This is a safe default that allows draws immediately after deployment. Importantly, the freeze flag only affects `draw_credit` calls — `repay_credit` is never blocked by this flag, ensuring borrowers can always repay their debt even during emergency liquidity operations.
 
 ---
 
@@ -515,6 +667,9 @@ The `Credit` contract uses standard `u32` discriminants for standardized error h
 | `25`       | `LiquidityTokenCallFailed`       | Liquidity token call failed where the contract can observe it.                |
 | `26`       | `InsufficientRepaymentAllowance` | Borrower's token allowance is below the effective repayment amount.           |
 | `27`       | `InsufficientRepaymentBalance`   | Borrower's token balance is below the effective repayment amount.             |
+| `28`       | `RepayExceedsMaxAmount`          | The requested repay exceeds the configured per-transaction maximum.           |
+| `29`       | `DrawCooldownActive`             | Borrower attempted to draw again before the cooldown interval elapsed.        |
+| `54`       | `AdminCooldownActive`            | Critical borrower admin action attempted before the cooldown elapsed.         |
 
 ---
 
@@ -590,7 +745,8 @@ cargo test -p creditra-credit amount_validation
 | `("credit", "liq_setl")`   | `liq_setl` | `settle_default_liquidation`| Auction settlement applied to debt accounting |
 | `("credit", "reinstate")`  | `reinstate`| `reinstate_credit_line`     | Line reinstated |
 | `("credit", "risk_updated")`| `risk_updated` | `update_risk_parameters` | Risk parameters changed |
-| `("credit", "drw_freeze")` | `DrawsFrozenEvent` | `freeze_draws`, `unfreeze_draws` | Global draw freeze toggled |
+| `("credit", "drw_freeze")` | `DrawsFrozenEvent` | `freeze_draws`, `unfreeze_draws` | Global draw freeze toggled (`frozen`, `reason`) |
+| `("credit", "line_frz")` | `CreditLineFreezeEvent` | `freeze_credit_line`, `unfreeze_credit_line` | Per-line draw freeze toggled (`borrower`, `reason`, `frozen`, `ledger`) |
 
 The contract also emits additive v2 event topics (for indexer analytics fields
 like actor/source/timestamp identifiers) while keeping v1 payloads stable. See
@@ -631,6 +787,163 @@ like actor/source/timestamp identifiers) while keeping v1 payloads stable. See
 - Default liquidation lifecycle: `default_credit_line` emits `liq_req` → auction flow executes off-chain/on-chain as configured → admin applies proceeds via `settle_default_liquidation`.
 - Oracle-assisted default design: `docs/default-oracle.md`.
 - Auction hook architecture: `docs/default-liquidation-auction-hook.md`.
+
+---
+
+## Keeper Integration and Default Eligibility
+
+Off-chain automated agents (keepers) and risk monitors track borrower health, evaluate solvency, and propose or trigger default liquidations. This section details how keepers should interact with the protocol, the calculations and blind spots of the on-chain health factor query, and recommended decision pipelines.
+
+### Understanding `get_health_factor`
+
+The `get_health_factor(borrower)` view entrypoint computes a collateral-to-debt ratio scaled in basis points (bps):
+
+$$\text{health\_bps} = \frac{\text{collateral} \times 100\,000\,000}{\text{utilized\_amount} \times \text{min\_ratio\_bps}}$$
+
+- **Base Parity**: `10_000` bps (100%) represents a position whose collateral exactly satisfies the configured minimum collateral ratio (`MinCollateralRatioBps`, defaulting to `15_000` bps / 150%).
+- **Infinite Health**: When a borrower has no debt (`utilized_amount <= 0`), the function returns `u32::MAX`.
+- **Under-collateralization**: A value strictly below `10_000` indicates that the nominal deposited collateral is insufficient to meet the required collateral threshold.
+
+### Health Factor Blind Spots & Excluded Inputs
+
+Keepers must **never** treat `get_health_factor` as a complete or self-sufficient liquidation signal. The on-chain calculation is deliberately lightweight and omits several vital risk dimensions:
+
+1. **Excluded: Multi-Token Collateral**:
+   The contract only checks the single on-chain collateral balance record (`DataKey::Collateral(borrower)`). Any collateral deposited across multi-token vaults, secondary collateral tokens, or external escrow accounts is completely ignored by this metric.
+2. **Excluded: Asset Risk Weights and Haircuts**:
+   Every unit of collateral is credited at face value (100% nominal weight). The calculation does not apply volatility haircuts, liquidity tiers, or asset-specific collateral factors.
+3. **Excluded: Oracle Pricing and Exchange Rates**:
+   `get_health_factor` assumes a 1:1 nominal unit parity between the collateral token and the borrowed liquidity token. It does **not** fetch or integrate oracle price feeds. Consequently, market price movements, exchange rate fluctuations, and stablecoin depeg events are completely invisible to this query.
+4. **Excluded: Installment Delinquency and Payment Schedules**:
+   A borrower may be in severe payment default on their installment schedule despite maintaining sufficient collateral. `get_health_factor` does not evaluate repayment schedules or missed payments. Keepers must query [`is_delinquent`](#is_delinquentenv-borrower) to detect schedule delinquency.
+5. **Excluded: Uncheckpointed Pending Interest**:
+   The stored `utilized_amount` reflects debt up to the most recent mutating contract call (draw, repay, or admin action). Uncapitalized interest accrued since `last_accrual_ts` is not included in the read-only query output.
+
+### Crucial Invariant: Default Does NOT Check Health Factor On-Chain
+
+A common misconception among keeper operators is that the contract enforces under-collateralization before allowing a credit line to be defaulted.
+
+> [!WARNING]
+> **`default_credit_line` does NOT consult `get_health_factor` on-chain.**
+> The `default_credit_line` entrypoint is an **administrative discretionary action** (`require_admin_auth`). The on-chain contract validates only:
+> 1. Protocol is not paused (`assert_not_paused`).
+> 2. Caller has admin authorization (`require_admin_auth`).
+> 3. Credit line exists and is not already in a terminal state (`Closed`).
+> 4. Valid status transition (`Active`, `Suspended`, `SelfSuspended`, or `Restricted` $\to$ `Defaulted`).
+> 5. Any active per-borrower liquidation grace period has expired (`LiquidationGraceActive`).
+>
+> The contract will **not** reject a default call if `get_health_factor >= 10_000`, nor will it automatically default a line when `get_health_factor < 10_000`. Keepers must implement all validation and threshold checks off-chain.
+
+### Recommended Keeper Decision Logic
+
+Production keepers should implement a multi-factor evaluation pipeline before proposing or executing `default_credit_line`:
+
+```text
+                           ┌────────────────────────┐
+                           │   Poll Borrower Line   │
+                           └───────────┬────────────┘
+                                       │
+                         Is protocol paused or Closed?
+                                ├── Yes ──> [ Skip ]
+                                └── No
+                                       │
+                      ┌────────────────┴────────────────┐
+                      ▼                                 ▼
+             [ Delinquency Path ]             [ Collateral Path ]
+                      │                                 │
+           Call `is_delinquent(borrower)`    Compute Oracle-Adjusted HF:
+           Is borrower delinquent?           value = Σ(balance_i × price_i × haircut_i)
+                      │                      effective_debt = utilized + pending_interest
+           ├── Yes: Check grace period       health = value / (effective_debt × min_ratio)
+           │   Past grace?                              │
+           │   ├── Yes ──> [ Default Eligible ]         │
+           │   └── No  ──> [ In Grace Window ]          │
+           └── No: Clean payment record                 │
+                                                        │
+                      ┌─────────────────────────────────┘
+                      ▼
+         Evaluate Health Factor Thresholds:
+         • HF >= 12_000 (>= 120%) : Healthy / Safe
+         • 10_000 <= HF < 12_000  : Caution / Monitor
+         • HF < 10_000 (< 100%)   : Under-collateralized (Default Candidate)
+         • HF < 8_000 (< 80%)     : Critical Solvency Risk (Urgent Default)
+                      │
+           Eligible for liquidation?
+           ├── Yes: Verify Liquidation Grace Window
+           │   Expired?
+           │   ├── Yes ──> [ Execute/Propose default_credit_line ]
+           │   └── No  ──> [ Queue for expiry ]
+           └── No: Healthy position
+```
+
+### Keeper Action Thresholds
+
+| Health Factor (bps) | Collateral Ratio vs Requirement | Risk Category | Keeper Operational Action |
+|---|---|---|---|
+| `u32::MAX` | No outstanding debt | Zero Risk | No action required. Position is fully unencumbered. |
+| `≥ 12_000` | $\ge 120\%$ of minimum | Well-Collateralized | Healthy buffer. Routine periodic monitoring. |
+| `10_000..11_999` | $100\% - 120\%$ of minimum | Moderate Risk / Caution | Elevated monitoring frequency; notify borrower if alert hook configured. |
+| `< 10_000` | $< 100\%$ of minimum | Under-Collateralized | **Default Candidate**: Verify off-chain oracle prices and liquidation grace; submit default transaction. |
+| `< 8_000` | $< 80\%$ of minimum | Critically Under-Collateralized | **Urgent Default**: Immediate priority transaction to prevent protocol bad debt. |
+| *Any value* | `is_delinquent == true` past grace | Payment Default | **Default Candidate**: Delinquent on schedule; eligible for default regardless of collateral ratio. |
+
+### Example Keeper Implementation Workflow (Pseudocode)
+
+```rust
+// Off-chain Keeper Evaluation Loop
+async fn evaluate_borrower_for_default(
+    client: &CreditClient,
+    oracle: &PriceOracleClient,
+    borrower: &Address,
+) -> Result<KeeperAction, KeeperError> {
+    // 1. Fetch on-chain credit line snapshot
+    let snapshot = client.get_credit_line_snapshot(borrower).await?;
+    if snapshot.line.status == CreditStatus::Closed {
+        return Ok(KeeperAction::None);
+    }
+
+    // 2. Check payment schedule delinquency
+    if snapshot.is_delinquent {
+        let grace_seconds = client.get_per_borrower_liquidation_grace(borrower).await?;
+        let now = current_ledger_timestamp();
+        let base_ts = snapshot.line.suspension_ts.max(snapshot.repayment_schedule.next_due_ts);
+        if now >= base_ts + grace_seconds {
+            return Ok(KeeperAction::TriggerDefault {
+                reason: DefaultReason::Delinquency,
+            });
+        }
+    }
+
+    // 3. Fetch comprehensive oracle-priced collateral valuation
+    let oracle_price = oracle.get_price(&COLLATERAL_TOKEN).await?;
+    let raw_hf = snapshot.health_factor_bps;
+
+    // 4. Calculate real market-adjusted health factor
+    let market_adjusted_hf = calculate_market_health_factor(
+        snapshot.collateral_balance,
+        oracle_price,
+        snapshot.line.utilized_amount,
+        snapshot.line.accrued_interest,
+    );
+
+    // 5. Evaluate against keeper thresholds
+    if market_adjusted_hf < 8_000 {
+        Ok(KeeperAction::TriggerDefault {
+            reason: DefaultReason::CriticalUndercollateralization,
+        })
+    } else if market_adjusted_hf < 10_000 {
+        Ok(KeeperAction::TriggerDefault {
+            reason: DefaultReason::Undercollateralization,
+        })
+    } else if market_adjusted_hf < 12_000 {
+        Ok(KeeperAction::LogWarning {
+            health_factor: market_adjusted_hf,
+        })
+    } else {
+        Ok(KeeperAction::None)
+    }
+}
+```
 
 ---
 
